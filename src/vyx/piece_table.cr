@@ -225,9 +225,24 @@ module Vyx
       getter kind : Symbol
       getter index : Int32
       getter text : String
+      getter meta : Hash(String, Int32)
 
-      def initialize(@kind : Symbol, @index : Int32, @text : String = "")
+      def initialize(@kind : Symbol, @index : Int32, @text : String = "", @meta = {} of String => Int32)
       end
+    end
+
+    private def internal_add_marker_with_id(id : Int32, abs_offset : Int32, affinity : Symbol = :after)
+      abs = [[abs_offset, 0].max, length].min
+      node, off = find_node_and_offset(abs)
+      m = Marker.new(id, affinity, node, off)
+      @markers[id] = m
+      if node
+        node_insert_marker(node, id, off)
+      end
+      if @next_marker_id <= id
+        @next_marker_id = id + 1
+      end
+      id
     end
 
     def add_marker(offset : Int32, affinity : Symbol = :after) : Int32
@@ -240,6 +255,13 @@ module Vyx
       if node
         node_insert_marker(node, id, off_in_piece)
       end
+
+      # record undo for marker add
+      unless @suppress_undo_record
+        @undo_stack << Operation.new(:add_marker, offset, affinity.to_s, {"id" => id})
+        @redo_stack.clear
+      end
+
       validate_marker_invariants
       id
     end
@@ -263,6 +285,17 @@ module Vyx
         delete(op.index, op.text.bytesize)
       when :delete
         insert(op.index, op.text)
+      when :add_marker
+        # undo an add_by removing the marker id
+        id = op.meta["id"]
+        if id
+          remove_marker(id)
+        end
+      when :remove_marker
+        id = op.meta["id"]
+        if id
+          internal_add_marker_with_id(id, op.index, op.text.to_sym)
+        end
       else
         @suppress_undo_record = false
         return false
@@ -281,6 +314,16 @@ module Vyx
         insert(op.index, op.text)
       when :delete
         delete(op.index, op.text.bytesize)
+      when :add_marker
+        id = op.meta["id"]
+        if id
+          internal_add_marker_with_id(id, op.index, op.text.to_sym)
+        end
+      when :remove_marker
+        id = op.meta["id"]
+        if id
+          remove_marker(id)
+        end
       else
         @suppress_undo_record = false
         return false
@@ -350,10 +393,27 @@ module Vyx
     def remove_marker(id : Int32)
       m = @markers[id]
       return false unless m
+
+      # capture absolute offset and affinity for undo
+      begin
+        abs = marker_offset(id)
+      rescue
+        abs = [[m.offset_in_piece, 0].max, length].min
+      end
+      aff = m.affinity
+
       if m.node
         node_remove_marker(m.node.not_nil!, id)
       end
+
       @markers.delete(id)
+
+      # record undo for marker remove
+      unless @suppress_undo_record
+        @undo_stack << Operation.new(:remove_marker, abs, aff.to_s, {"id" => id})
+        @redo_stack.clear
+      end
+
       validate_marker_invariants
       true
     end
