@@ -230,9 +230,10 @@ module Vyx
       getter kind : Symbol
       getter index : Int32
       getter text : String
-      getter meta : Hash(String, Int32)
+      getter meta : Hash(String, String)
+      getter sub_ops : Array(Operation)?
 
-      def initialize(@kind : Symbol, @index : Int32, @text : String = "", @meta = {} of String => Int32)
+      def initialize(@kind : Symbol, @index : Int32, @text : String = "", @meta = {} of String => String, @sub_ops : Array(Operation)? = nil)
       end
     end
 
@@ -295,8 +296,7 @@ module Vyx
       # record undo for marker add only if requested
       if undoable && !@suppress_undo_record
         aff_code = affinity == :after ? 0 : 1
-        @undo_stack << Operation.new(:add_marker, offset, "", {"id" => id, "aff" => aff_code})
-        @redo_stack.clear
+        record_operation(Operation.new(:add_marker, offset, "", {"id" => id.to_s, "aff" => aff_code.to_s}))
       end
 
       validate_marker_invariants
@@ -315,6 +315,9 @@ module Vyx
     def undo : Bool
       return false if @undo_stack.empty?
       op = @undo_stack.pop
+      if ENV.has_key?("VYX_DEBUG") && ENV["VYX_DEBUG"] == "1"
+        puts "UNDO apply op=#{op.kind} idx=#{op.index} text=#{op.text} meta=#{op.meta.inspect}"
+      end
       @suppress_undo_record = true
       case op.kind
       when :insert
@@ -350,6 +353,9 @@ module Vyx
     def redo : Bool
       return false if @redo_stack.empty?
       op = @redo_stack.pop
+      if ENV.has_key?("VYX_DEBUG") && ENV["VYX_DEBUG"] == "1"
+        puts "REDO apply op=#{op.kind} idx=#{op.index} text=#{op.text} meta=#{op.meta.inspect}"
+      end
       @suppress_undo_record = true
       case op.kind
       when :insert
@@ -463,8 +469,7 @@ module Vyx
       # record undo for marker remove only if requested
       if undoable && !@suppress_undo_record
         aff_code = aff == :after ? 0 : 1
-        @undo_stack << Operation.new(:remove_marker, abs, "", {"id" => id, "aff" => aff_code})
-        @redo_stack.clear
+        record_operation(Operation.new(:remove_marker, abs, "", {"id" => id.to_s, "aff" => aff_code.to_s}))
       end
 
       validate_marker_invariants
@@ -814,8 +819,7 @@ module Vyx
 
       # record undo (store forward operation) unless this is an undo/redo application
       unless @suppress_undo_record
-        @undo_stack << Operation.new(:insert, index, text)
-        @redo_stack.clear
+        record_operation(Operation.new(:insert, index, text))
       end
 
       # emit change event for external sync
@@ -1012,12 +1016,96 @@ module Vyx
 
       # record undo (store forward operation) unless this is an undo/redo application
       unless @suppress_undo_record
-        @undo_stack << Operation.new(:delete, index, deleted)
-        @redo_stack.clear
+        record_operation(Operation.new(:delete, index, deleted))
       end
 
       # emit change event
       emit_change(:delete, {"index" => index.to_s, "len" => to_delete.to_s})
+    end
+
+    # transaction & rollback helpers
+    private def record_operation(op : Operation)
+      if defined?(transaction_stack) && transaction_stack.size > 0
+        transaction_stack.last << op
+      else
+        @undo_stack << op
+        @redo_stack.clear
+      end
+    end
+
+    # perform inverse of an operation (caller should set @suppress_undo_record = true)
+    private def perform_inverse(op : Operation)
+      case op.kind
+      when :insert
+        delete(op.index, op.text.bytesize)
+      when :delete
+        insert(op.index, op.text)
+      when :add_marker
+        id = (op.meta.has_key?("id") ? op.meta["id"].to_i : nil)
+        remove_marker(id)
+      when :remove_marker
+        id = (op.meta.has_key?("id") ? op.meta["id"].to_i : nil)
+        if id
+          aff = op.meta.has_key?("aff") && op.meta["aff"].to_i == 1 ? :before : :after
+          internal_add_marker_with_id(id, op.index, aff)
+        end
+      when :transaction
+        if op.sub_ops
+          op.sub_ops.reverse_each do |sub|
+            perform_inverse(sub)
+          end
+        end
+      else
+        # no-op for unknown kinds
+      end
+    end
+
+    private def transaction_stack : Array(Array(Operation))
+      @transaction_stack ||= [] of Array(Operation)
+    end
+
+    def begin_transaction
+      transaction_stack << [] of Operation
+      nil
+    end
+
+    def rollback_transaction
+      ops = transaction_stack.pop
+      return false unless ops
+      @suppress_undo_record = true
+      ops.reverse_each do |op|
+        perform_inverse(op)
+      end
+      @suppress_undo_record = false
+      true
+    end
+
+    def commit_transaction
+      ops = transaction_stack.pop
+      return false unless ops
+      trans = Operation.new(:transaction, 0, "", {} of String => String, ops)
+      if transaction_stack.size > 0
+        transaction_stack.last << trans
+      else
+        @undo_stack << trans
+        @redo_stack.clear
+        emit_change(:transaction, {"count" => ops.size.to_s})
+      end
+      true
+    end
+
+    def apply_transaction
+      begin_transaction
+      begin
+        yield
+      rescue
+        rollback_transaction
+        raise
+      ensure
+        if transaction_stack.size > 0
+          commit_transaction
+        end
+      end
     end
 
     private def collect_marker_ids(node : Node?, arr : Array(Int32))
@@ -1085,7 +1173,7 @@ module Vyx
       remap_all_markers
 
       # emit compaction event for external listeners
-      emit_change(:compact, {})
+      emit_change(:compact, {} of String => String)
     end
 
     private def rightmost_node(node : Node?) : Node?

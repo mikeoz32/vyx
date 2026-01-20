@@ -48,6 +48,17 @@ describe "Undo/Redo stress" do
           end
         end
 
+        # occasionally wrap a small transaction
+        if rng.rand(10) == 0
+          pt.apply_transaction do
+            3.times do
+              idx = rng.rand(0..pt.length)
+              txt = "x" * rng.rand(1..3)
+              pt.insert(idx, txt)
+            end
+          end
+        end
+
         # perform all undos
         while pt.undo_available?
           pt.undo
