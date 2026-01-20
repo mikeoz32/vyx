@@ -154,6 +154,9 @@ module Vyx
       @redo_stack = [] of Operation
       @suppress_undo_record = false
 
+      # change listeners for external sync (VYX-32)
+      @change_listeners = [] of Proc(ChangeEvent, Nil)
+
       if @original.bytesize > 0
         node = Node.new(Piece.new(Piece::Source::ORIGINAL, 0, @original.bytesize))
         node.as(Node).update!(@original, @add)
@@ -179,8 +182,10 @@ module Vyx
 
     # Debug helper: return [global_offset, node_piece_start, node_piece_len, offset_in_piece]
     def debug_marker_info(id : Int32)
+      unless @markers.has_key?(id)
+        raise ArgumentError.new("unknown marker")
+      end
       m = @markers[id]
-      raise ArgumentError.new("unknown marker") unless m
       node = m.node
       off = m.offset_in_piece
       goff = marker_offset(id)
@@ -231,6 +236,16 @@ module Vyx
       end
     end
 
+    # Event type for clients to resync on edits or undo/redo
+    class ChangeEvent
+      getter type : Symbol
+      getter generation : Int32
+      getter details : Hash(String, String)
+
+      def initialize(@type : Symbol, @generation : Int32, @details : Hash(String, String) = {} of String => String)
+      end
+    end
+
     private def internal_add_marker_with_id(id : Int32, abs_offset : Int32, affinity : Symbol = :after)
       abs = [[abs_offset, 0].max, length].min
       node, off = find_node_and_offset(abs)
@@ -245,7 +260,28 @@ module Vyx
       id
     end
 
-    def add_marker(offset : Int32, affinity : Symbol = :after) : Int32
+    # add/remove change listeners
+    def add_change_listener(&block : Proc(ChangeEvent, Nil)) : Proc(ChangeEvent, Nil)
+      @change_listeners << block
+      block
+    end
+
+    def remove_change_listener(listener : Proc(ChangeEvent, Nil)) : Bool
+      @change_listeners.delete(listener)
+    end
+
+    private def emit_change(type : Symbol, details = {} of String => String)
+      evt = ChangeEvent.new(type, @generation, details)
+      @change_listeners.each do |cb|
+        begin
+          cb.call(evt)
+        rescue
+          # swallow listener errors
+        end
+      end
+    end
+
+    def add_marker(offset : Int32, affinity : Symbol = :after, undoable : Bool = false) : Int32
       raise ArgumentError.new("offset out of bounds") if offset < 0 || offset > length
       node, off_in_piece = find_node_and_offset(offset)
       id = @next_marker_id
@@ -256,9 +292,10 @@ module Vyx
         node_insert_marker(node, id, off_in_piece)
       end
 
-      # record undo for marker add
-      unless @suppress_undo_record
-        @undo_stack << Operation.new(:add_marker, offset, affinity.to_s, {"id" => id})
+      # record undo for marker add only if requested
+      if undoable && !@suppress_undo_record
+        aff_code = affinity == :after ? 0 : 1
+        @undo_stack << Operation.new(:add_marker, offset, "", {"id" => id, "aff" => aff_code})
         @redo_stack.clear
       end
 
@@ -294,7 +331,8 @@ module Vyx
       when :remove_marker
         id = op.meta["id"]
         if id
-          internal_add_marker_with_id(id, op.index, op.text.to_sym)
+          aff = op.meta.has_key?("aff") && op.meta["aff"] == 1 ? :before : :after
+          internal_add_marker_with_id(id, op.index, aff)
         end
       else
         @suppress_undo_record = false
@@ -302,6 +340,10 @@ module Vyx
       end
       @suppress_undo_record = false
       @redo_stack << op
+
+      # emit undo change event
+      emit_change(:undo, {"kind" => op.kind.to_s})
+
       true
     end
 
@@ -317,7 +359,11 @@ module Vyx
       when :add_marker
         id = op.meta["id"]
         if id
-          internal_add_marker_with_id(id, op.index, op.text.to_sym)
+          aff = op.meta.has_key?("aff") && op.meta["aff"] == 1 ? :before : :after
+          internal_add_marker_with_id(id, op.index, aff)
+          if ENV.has_key?("VYX_DEBUG") && ENV["VYX_DEBUG"] == "1"
+            puts "redo add_marker id=#{id} meta=#{op.meta} markers=#{@markers.keys.inspect}"
+          end
         end
       when :remove_marker
         id = op.meta["id"]
@@ -330,6 +376,10 @@ module Vyx
       end
       @suppress_undo_record = false
       @undo_stack << op
+
+      # emit redo change event
+      emit_change(:redo, {"kind" => op.kind.to_s})
+
       true
     end
 
@@ -390,9 +440,11 @@ module Vyx
       end
     end
 
-    def remove_marker(id : Int32)
+    def remove_marker(id : Int32, undoable : Bool = false)
+      unless @markers.has_key?(id)
+        return false
+      end
       m = @markers[id]
-      return false unless m
 
       # capture absolute offset and affinity for undo
       begin
@@ -408,9 +460,10 @@ module Vyx
 
       @markers.delete(id)
 
-      # record undo for marker remove
-      unless @suppress_undo_record
-        @undo_stack << Operation.new(:remove_marker, abs, aff.to_s, {"id" => id})
+      # record undo for marker remove only if requested
+      if undoable && !@suppress_undo_record
+        aff_code = aff == :after ? 0 : 1
+        @undo_stack << Operation.new(:remove_marker, abs, "", {"id" => id, "aff" => aff_code})
         @redo_stack.clear
       end
 
@@ -419,8 +472,10 @@ module Vyx
     end
 
     def marker_offset(id : Int32) : Int32
+      unless @markers.has_key?(id)
+        raise ArgumentError.new("unknown marker")
+      end
       m = @markers[id]
-      raise ArgumentError.new("unknown marker") unless m
       if m.node.nil?
         # stored absolute offset
         return [[m.offset_in_piece, 0].max, length].min
@@ -763,6 +818,9 @@ module Vyx
         @redo_stack.clear
       end
 
+      # emit change event for external sync
+      emit_change(:insert, {"index" => index.to_s, "len" => add_len.to_s})
+
       compact_if_needed
     end
 
@@ -840,6 +898,19 @@ module Vyx
         end
       end
 
+    end
+
+    # Snapshot of markers for clients (id -> absolute offset)
+    def marker_snapshot : Hash(Int32, Int32)
+      snap = {} of Int32 => Int32
+      @markers.each do |id, m|
+        begin
+          snap[id] = marker_offset(id)
+        rescue
+          snap[id] = [[m.offset_in_piece, 0].max, length].min
+        end
+      end
+      snap
     end
 
     private def validate_marker_invariants
@@ -944,6 +1015,9 @@ module Vyx
         @undo_stack << Operation.new(:delete, index, deleted)
         @redo_stack.clear
       end
+
+      # emit change event
+      emit_change(:delete, {"index" => index.to_s, "len" => to_delete.to_s})
     end
 
     private def collect_marker_ids(node : Node?, arr : Array(Int32))
@@ -1009,6 +1083,9 @@ module Vyx
 
       # final remap for absolute markers
       remap_all_markers
+
+      # emit compaction event for external listeners
+      emit_change(:compact, {})
     end
 
     private def rightmost_node(node : Node?) : Node?
