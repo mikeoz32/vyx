@@ -149,6 +149,11 @@ module Vyx
       @markers = {} of Int32 => Marker
       @marker_lock = Mutex.new
 
+      # Undo/Redo stacks (store original forward operations)
+      @undo_stack = [] of Operation
+      @redo_stack = [] of Operation
+      @suppress_undo_record = false
+
       if @original.bytesize > 0
         node = Node.new(Piece.new(Piece::Source::ORIGINAL, 0, @original.bytesize))
         node.as(Node).update!(@original, @add)
@@ -215,6 +220,16 @@ module Vyx
       end
     end
 
+    # Operation representation for undo/redo (store forward-op)
+    class Operation
+      getter kind : Symbol
+      getter index : Int32
+      getter text : String
+
+      def initialize(@kind : Symbol, @index : Int32, @text : String = "")
+      end
+    end
+
     def add_marker(offset : Int32, affinity : Symbol = :after) : Int32
       raise ArgumentError.new("offset out of bounds") if offset < 0 || offset > length
       node, off_in_piece = find_node_and_offset(offset)
@@ -227,6 +242,52 @@ module Vyx
       end
       validate_marker_invariants
       id
+    end
+
+    # Undo/Redo API
+    def undo_available? : Bool
+      !@undo_stack.empty?
+    end
+
+    def redo_available? : Bool
+      !@redo_stack.empty?
+    end
+
+    def undo : Bool
+      return false if @undo_stack.empty?
+      op = @undo_stack.pop
+      @suppress_undo_record = true
+      case op.kind
+      when :insert
+        # inverse is delete at same index and length
+        delete(op.index, op.text.bytesize)
+      when :delete
+        insert(op.index, op.text)
+      else
+        @suppress_undo_record = false
+        return false
+      end
+      @suppress_undo_record = false
+      @redo_stack << op
+      true
+    end
+
+    def redo : Bool
+      return false if @redo_stack.empty?
+      op = @redo_stack.pop
+      @suppress_undo_record = true
+      case op.kind
+      when :insert
+        insert(op.index, op.text)
+      when :delete
+        delete(op.index, op.text.bytesize)
+      else
+        @suppress_undo_record = false
+        return false
+      end
+      @suppress_undo_record = false
+      @undo_stack << op
+      true
     end
 
     private def node_insert_marker(node : Node, id : Int32, offset_in_piece : Int32)
@@ -636,6 +697,12 @@ module Vyx
       remap_all_markers(snapshot)
       validate_marker_invariants
 
+      # record undo (store forward operation) unless this is an undo/redo application
+      unless @suppress_undo_record
+        @undo_stack << Operation.new(:insert, index, text)
+        @redo_stack.clear
+      end
+
       compact_if_needed
     end
 
@@ -784,6 +851,9 @@ module Vyx
         end
       end
 
+      # capture deleted text before discarding mid
+      deleted = slice(index, to_delete)
+
       left, rest = split(@root, index)
       mid, right = split(rest, to_delete)
 
@@ -808,6 +878,12 @@ module Vyx
       # final remap for absolute markers using precomputed snapshot
       remap_all_markers(snapshot)
       validate_marker_invariants
+
+      # record undo (store forward operation) unless this is an undo/redo application
+      unless @suppress_undo_record
+        @undo_stack << Operation.new(:delete, index, deleted)
+        @redo_stack.clear
+      end
     end
 
     private def collect_marker_ids(node : Node?, arr : Array(Int32))
