@@ -1297,6 +1297,7 @@ module Vyx
     end
 
     def rollback_transaction
+      return false if transaction_stack.empty?
       ops = transaction_stack.pop
       snapshot_before = transaction_marker_stack.pop
       return false unless ops
@@ -1311,6 +1312,7 @@ module Vyx
     end
 
     def commit_transaction
+      return false if transaction_stack.empty?
       ops = transaction_stack.pop
       snapshot_before = transaction_marker_stack.pop
       return false unless ops

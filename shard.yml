@@ -10,4 +10,9 @@ targets:
 
 crystal: '>= 1.18.2'
 
+dependencies:
+  ametist:
+    git: "https://github.com/mikeoz32/ametist.git"
+    branch: "master"
+
 license: MIT

@@ -4,7 +4,7 @@ module Vyx
   # TextBuffer provides a thin, editor-facing wrapper around the PieceTable
   # implementation. It exposes a stable, well-documented API that the Editor
   # layer will consume (cursor/selection, command processor, etc.).
-  
+
   class TextBuffer
     getter piece_table : PieceTable
 

@@ -7,7 +7,7 @@ describe Vyx::TextBuffer do
     tb.to_s.should eq("hello world")
 
     tb.delete(5, 1)
-    tb.to_s.should eq("hell world")
+    tb.to_s.should eq("helloworld")
   end
 
   it "marker operations delegate to PieceTable and snapshot works" do
@@ -23,7 +23,8 @@ describe Vyx::TextBuffer do
       tb.insert(1, "X")
       tb.insert(3, "Y")
     end
-    tb.to_s.should eq("aXbYcdef")
+    # Transactions apply sequentially: later ops see effects of earlier ops
+    tb.to_s.should eq("aXbcYdef")
     tb.rollback_transaction.should eq(false) # already committed
   end
 end

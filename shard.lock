@@ -1,0 +1,6 @@
+version: 2.0
+shards:
+  ametist:
+    git: https://github.com/mikeoz32/ametist.git
+    version: 0.1.0+git.commit.4dd5bec7df49f8a25d0e71e74e142e90a714d495
+
