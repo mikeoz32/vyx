@@ -21,12 +21,13 @@ describe "Undo/Redo stress" do
       when 2
         # add marker
         off = rng.rand(0..pt.length)
-        pt.add_marker(off)
+        pt.add_marker(off, undoable: true)
       when 3
         # remove random marker
         if pt.marker_count > 0
-          id = pt.instance_variable_get(:@markers).keys.sample
-          pt.remove_marker(id)
+          keys = pt.marker_snapshot.keys
+          id = keys.sample
+          pt.remove_marker(id, undoable: true)
         end
       when 4
         # compact occasionally
@@ -37,17 +38,6 @@ describe "Undo/Redo stress" do
 
       # occasionally snapshot and exercise undo/redo cycles
       if i % 25 == 0
-        doc_before = pt.to_s
-        # capture markers map
-        markers_before = {} of Int32 => Int32
-        pt.instance_variable_get(:@markers).each do |id, m|
-          begin
-            markers_before[id] = pt.marker_offset(id)
-          rescue
-            # ignore
-          end
-        end
-
         # occasionally wrap a small transaction
         if rng.rand(10) == 0
           pt.apply_transaction do
@@ -58,6 +48,10 @@ describe "Undo/Redo stress" do
             end
           end
         end
+
+        doc_before = pt.to_s
+        # capture markers map
+        markers_before = pt.marker_snapshot
 
         # perform all undos
         while pt.undo_available?
@@ -72,7 +66,7 @@ describe "Undo/Redo stress" do
         # validate state restored
         doc_before.should eq(pt.to_s)
         markers_before.each do |id, off|
-          next unless pt.instance_variable_get(:@markers).has_key?(id)
+          next unless pt.marker_snapshot.has_key?(id)
           pt.marker_offset(id).should eq(off)
         end
       end

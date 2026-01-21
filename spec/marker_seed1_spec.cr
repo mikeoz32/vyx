@@ -4,7 +4,7 @@ require "../src/vyx"
 # This test is skipped by default. To run it locally set:
 #   RUN_MARKER_REPRO=1 crystal spec spec/marker_seed1_spec.cr
 
-if ENV["RUN_MARKER_REPRO"] == "1"
+if ENV.has_key?("RUN_MARKER_REPRO") && ENV["RUN_MARKER_REPRO"] == "1"
   describe "marker seed=1 regression (VYX-32)" do
     it "reproduces failing sequence for seed=1" do
       ops = [
@@ -103,7 +103,7 @@ if ENV["RUN_MARKER_REPRO"] == "1"
       expected.each do |lab, exp|
         id = label_map[lab]
         next unless id
-        expect(pt.marker_offset(id)).to eq(exp)
+        pt.marker_offset(id).should eq(exp)
       end
     end
   end

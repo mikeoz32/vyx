@@ -231,9 +231,11 @@ module Vyx
       getter index : Int32
       getter text : String
       getter meta : Hash(String, String)
+      getter marker_offsets : Hash(Int32, Int32)?
+      getter marker_offsets_after : Hash(Int32, Int32)?
       getter sub_ops : Array(Operation)?
 
-      def initialize(@kind : Symbol, @index : Int32, @text : String = "", @meta = {} of String => String, @sub_ops : Array(Operation)? = nil)
+      def initialize(@kind : Symbol, @index : Int32, @text : String = "", @meta = {} of String => String, @marker_offsets : Hash(Int32, Int32)? = nil, @marker_offsets_after : Hash(Int32, Int32)? = nil, @sub_ops : Array(Operation)? = nil)
       end
     end
 
@@ -296,7 +298,7 @@ module Vyx
       # record undo for marker add only if requested
       if undoable && !@suppress_undo_record
         aff_code = affinity == :after ? 0 : 1
-        record_operation(Operation.new(:add_marker, offset, "", {"id" => id.to_s, "aff" => aff_code.to_s}))
+        record_operation(Operation.new(:add_marker, offset, "", {"id" => id.to_s, "aff" => aff_code.to_s}, nil, nil))
       end
 
       validate_marker_invariants
@@ -325,17 +327,27 @@ module Vyx
         delete(op.index, op.text.bytesize)
       when :delete
         insert(op.index, op.text)
+        if op.marker_offsets
+          restore_marker_offsets(op.marker_offsets.not_nil!)
+        end
       when :add_marker
-        # undo an add_by removing the marker id
-        id = op.meta["id"]
-        if id
-          remove_marker(id)
+        # undo an add by removing the marker id
+        if op.meta.has_key?("id")
+          id = op.meta["id"].to_i
+          remove_marker(id, false)
         end
       when :remove_marker
-        id = op.meta["id"]
-        if id
-          aff = op.meta.has_key?("aff") && op.meta["aff"] == 1 ? :before : :after
+        if op.meta.has_key?("id")
+          id = op.meta["id"].to_i
+          aff = op.meta.has_key?("aff") && op.meta["aff"].to_i == 1 ? :before : :after
           internal_add_marker_with_id(id, op.index, aff)
+        end
+      when :transaction
+        if op.sub_ops != nil
+          unapply_ops_with_index_remap(op.sub_ops.not_nil!)
+          if op.marker_offsets
+            restore_marker_offsets(op.marker_offsets.not_nil!)
+          end
         end
       else
         @suppress_undo_record = false
@@ -363,18 +375,26 @@ module Vyx
       when :delete
         delete(op.index, op.text.bytesize)
       when :add_marker
-        id = op.meta["id"]
-        if id
-          aff = op.meta.has_key?("aff") && op.meta["aff"] == 1 ? :before : :after
+        if op.meta.has_key?("id")
+          id = op.meta["id"].to_i
+          aff = op.meta.has_key?("aff") && op.meta["aff"].to_i == 1 ? :before : :after
           internal_add_marker_with_id(id, op.index, aff)
           if ENV.has_key?("VYX_DEBUG") && ENV["VYX_DEBUG"] == "1"
             puts "redo add_marker id=#{id} meta=#{op.meta} markers=#{@markers.keys.inspect}"
           end
         end
       when :remove_marker
-        id = op.meta["id"]
-        if id
-          remove_marker(id)
+        if op.meta.has_key?("id")
+          id = op.meta["id"].to_i
+          remove_marker(id, false)
+        end
+      when :transaction
+        if op.sub_ops != nil
+          # apply sub-ops in order while remapping indices to account for prior sub-ops
+          apply_ops_with_index_remap(op.sub_ops.not_nil!)
+          if op.marker_offsets_after
+            restore_marker_offsets(op.marker_offsets_after.not_nil!)
+          end
         end
       else
         @suppress_undo_record = false
@@ -469,7 +489,7 @@ module Vyx
       # record undo for marker remove only if requested
       if undoable && !@suppress_undo_record
         aff_code = aff == :after ? 0 : 1
-        record_operation(Operation.new(:remove_marker, abs, "", {"id" => id.to_s, "aff" => aff_code.to_s}))
+        record_operation(Operation.new(:remove_marker, abs, "", {"id" => id.to_s, "aff" => aff_code.to_s}, nil, nil))
       end
 
       validate_marker_invariants
@@ -785,16 +805,54 @@ module Vyx
       end
       -1
     end
+    private def remap_index_in_list(index : Int32, prev_ops : Array(Operation)) : Int32
+      adj = index
+      prev_ops.each do |p|
+        case p.kind
+        when :insert
+          if p.index <= index
+            adj += p.text.bytesize
+          end
+        when :delete
+          if p.index < index
+            adj -= p.text.bytesize
+          end
+        end
+      end
+      adj
+    end
+
+    private def flat_transaction_ops_before_current : Array(Operation)
+      ops = [] of Operation
+      transaction_stack.each do |arr|
+        arr.each do |op|
+          ops << op
+        end
+      end
+      ops
+    end
+
     def insert(index : Int32, text : String)
       raise ArgumentError.new("index out of bounds") if index < 0 || index > length
       return if text.empty?
+
+      # if inside a transaction, remap provided index (relative to transaction base) to current document index
+      if transaction_stack.size > 0
+        prev_ops = flat_transaction_ops_before_current
+        adjusted_index = remap_index_in_list(index, prev_ops)
+        op_meta = {"adj" => adjusted_index.to_s}
+      else
+        adjusted_index = index
+        op_meta = {} of String => String
+      end
+
 
       # snapshot marker absolute offsets BEFORE mutation and apply insert shift to snapshot
       snapshot = snapshot_all_marker_offsets
 
       add_len = text.bytesize
       snapshot.each do |id, off|
-        if off >= index
+        if off >= adjusted_index
           snapshot[id] = off + add_len
         end
       end
@@ -803,7 +861,7 @@ module Vyx
       new_piece = Piece.new(Piece::Source::ADD, add_start, add_len)
       new_node = Node.new(new_piece)
 
-      left, right = split(@root, index)
+      left, right = split(@root, adjusted_index)
       # update new_node (it contains piece referencing add buffer)
       new_node.update!(@original, @add)
       @root = merge(merge(left, new_node), right)
@@ -811,7 +869,7 @@ module Vyx
       @generation += 1
 
       # apply shifts for absolute markers as before
-      shift_absolute_markers(index, add_len)
+      shift_absolute_markers(adjusted_index, add_len)
 
       # remap all markers using the precomputed snapshot (already adjusted for insert)
       remap_all_markers(snapshot)
@@ -819,11 +877,12 @@ module Vyx
 
       # record undo (store forward operation) unless this is an undo/redo application
       unless @suppress_undo_record
-        record_operation(Operation.new(:insert, index, text))
+        # record original (base) index, and include adjusted index when in a transaction
+        record_operation(Operation.new(:insert, index, text, op_meta, nil, nil))
       end
 
       # emit change event for external sync
-      emit_change(:insert, {"index" => index.to_s, "len" => add_len.to_s})
+      emit_change(:insert, {"index" => adjusted_index.to_s, "len" => add_len.to_s})
 
       compact_if_needed
     end
@@ -974,22 +1033,39 @@ module Vyx
     def delete(index : Int32, len : Int32)
       raise ArgumentError.new("index out of bounds") if index < 0 || index >= length
       return if len <= 0
-      to_delete = [len, length - index].min
+
+      # if inside a transaction, remap provided index (relative to transaction base) to current document index
+      if transaction_stack.size > 0
+        prev_ops = flat_transaction_ops_before_current
+        adjusted_index = remap_index_in_list(index, prev_ops)
+        op_meta = {"adj" => adjusted_index.to_s}
+      else
+        adjusted_index = index
+        op_meta = {} of String => String
+      end
+
+      to_delete = [len, length - adjusted_index].min
 
       # snapshot marker offsets BEFORE mutation and apply delete transform to snapshot
       snapshot = snapshot_all_marker_offsets
+      deleted_marker_offsets = {} of Int32 => Int32
       snapshot.each do |id, off|
-        if off >= index && off < index + to_delete
-          snapshot[id] = index
-        elsif off >= index + to_delete
+        if off >= adjusted_index && off < adjusted_index + to_delete
+          deleted_marker_offsets[id] = off
+        end
+      end
+      snapshot.each do |id, off|
+        if off >= adjusted_index && off < adjusted_index + to_delete
+          snapshot[id] = adjusted_index
+        elsif off >= adjusted_index + to_delete
           snapshot[id] = off - to_delete
         end
       end
 
       # capture deleted text before discarding mid
-      deleted = slice(index, to_delete)
+      deleted = slice(adjusted_index, to_delete)
 
-      left, rest = split(@root, index)
+      left, rest = split(@root, adjusted_index)
       mid, right = split(rest, to_delete)
 
 
@@ -1002,9 +1078,9 @@ module Vyx
       # shift absolute markers for deleted range: markers in [index, index+to_delete) move to index, markers after shrink
       @markers.each do |id, m|
         if m.node.nil?
-          if m.offset_in_piece >= index && m.offset_in_piece < index + to_delete
-            m.offset_in_piece = index
-          elsif m.offset_in_piece >= index + to_delete
+          if m.offset_in_piece >= adjusted_index && m.offset_in_piece < adjusted_index + to_delete
+            m.offset_in_piece = adjusted_index
+          elsif m.offset_in_piece >= adjusted_index + to_delete
             m.offset_in_piece -= to_delete
           end
         end
@@ -1016,20 +1092,24 @@ module Vyx
 
       # record undo (store forward operation) unless this is an undo/redo application
       unless @suppress_undo_record
-        record_operation(Operation.new(:delete, index, deleted))
+        # record original base index and markers inside deleted range
+        record_operation(Operation.new(:delete, index, deleted, op_meta, deleted_marker_offsets, nil))
       end
 
       # emit change event
-      emit_change(:delete, {"index" => index.to_s, "len" => to_delete.to_s})
+      emit_change(:delete, {"index" => adjusted_index.to_s, "len" => to_delete.to_s})
     end
 
     # transaction & rollback helpers
     private def record_operation(op : Operation)
-      if defined?(transaction_stack) && transaction_stack.size > 0
+      if transaction_stack.size > 0
         transaction_stack.last << op
       else
         @undo_stack << op
         @redo_stack.clear
+      end
+      if ENV.has_key?("VYX_DEBUG") && ENV["VYX_DEBUG"] == "1"
+        puts "record_operation kind=#{op.kind} idx=#{op.index} text=#{op.text.inspect} trans_depth=#{transaction_stack.size}"
       end
     end
 
@@ -1041,22 +1121,164 @@ module Vyx
       when :delete
         insert(op.index, op.text)
       when :add_marker
-        id = (op.meta.has_key?("id") ? op.meta["id"].to_i : nil)
-        remove_marker(id)
+        if op.meta.has_key?("id")
+          id = op.meta["id"].to_i
+          remove_marker(id, false)
+        end
       when :remove_marker
-        id = (op.meta.has_key?("id") ? op.meta["id"].to_i : nil)
-        if id
+        if op.meta.has_key?("id")
+          id = op.meta["id"].to_i
           aff = op.meta.has_key?("aff") && op.meta["aff"].to_i == 1 ? :before : :after
           internal_add_marker_with_id(id, op.index, aff)
         end
       when :transaction
-        if op.sub_ops
-          op.sub_ops.reverse_each do |sub|
-            perform_inverse(sub)
-          end
+        if op.sub_ops != nil
+          # undo sub-ops in reverse using index remapping to account for earlier sub-ops
+          unapply_ops_with_index_remap(op.sub_ops.not_nil!)
         end
       else
         # no-op for unknown kinds
+      end
+    end
+
+    private def flatten_ops(ops : Array(Operation), acc = [] of Operation) : Array(Operation)
+      ops.each do |op|
+        if op.kind == :transaction && op.sub_ops
+          flatten_ops(op.sub_ops.not_nil!, acc)
+        else
+          acc << op
+        end
+      end
+      acc
+    end
+
+    private def restore_marker_offsets(saved : Hash(Int32, Int32))
+      snapshot = marker_snapshot
+      saved.each do |id, off|
+        if @markers.has_key?(id)
+          snapshot[id] = off
+        end
+      end
+      remap_all_markers(snapshot)
+      validate_marker_invariants
+    end
+
+    private def unapply_ops_with_index_remap(ops : Array(Operation))
+      # Undo ops in reverse order, remapping indices relative to the set of still-applied ops
+      applied = flatten_ops(ops).dup
+      while applied.size > 0
+        op = applied.last
+        k = applied.size - 1
+        prevs = applied[0...k]
+        case op.kind
+        when :insert
+          if op.meta.has_key?("adj")
+            idx = op.meta["adj"].to_i
+          else
+            idx = remap_index_in_list(op.index, prevs)
+          end
+          max_idx = length - op.text.bytesize
+          if max_idx < 0
+            max_idx = 0
+          end
+          if idx > max_idx
+            idx = max_idx
+          elsif idx < 0
+            idx = 0
+          end
+          delete(idx, op.text.bytesize)
+        when :delete
+          if op.meta.has_key?("adj")
+            idx = op.meta["adj"].to_i
+          else
+            idx = remap_index_in_list(op.index, prevs)
+          end
+          if idx < 0
+            idx = 0
+          elsif idx > length
+            idx = length
+          end
+          insert(idx, op.text)
+          if op.marker_offsets
+            restore_marker_offsets(op.marker_offsets.not_nil!)
+          end
+        when :add_marker
+          if op.meta.has_key?("id")
+            id = op.meta["id"].to_i
+            remove_marker(id, false)
+          end
+        when :remove_marker
+          if op.meta.has_key?("id")
+            id = op.meta["id"].to_i
+            idx = remap_index_in_list(op.index, prevs)
+            aff = op.meta.has_key?("aff") && op.meta["aff"].to_i == 1 ? :before : :after
+            internal_add_marker_with_id(id, idx, aff)
+          end
+        else
+          # ignore unknown op kinds
+        end
+        applied.delete_at(k)
+      end
+    end
+
+    private def apply_ops_with_index_remap(ops : Array(Operation))
+      done_ops = [] of Operation
+      flat_ops = flatten_ops(ops)
+      flat_ops.each do |op|
+        case op.kind
+        when :insert
+          if op.meta.has_key?("adj")
+            idx = op.meta["adj"].to_i
+          else
+            idx = remap_index_in_list(op.index, done_ops)
+          end
+          if idx < 0
+            idx = 0
+          elsif idx > length
+            idx = length
+          end
+          insert(idx, op.text)
+        when :delete
+          if op.meta.has_key?("adj")
+            idx = op.meta["adj"].to_i
+          else
+            idx = remap_index_in_list(op.index, done_ops)
+          end
+          if length > 0
+            if idx < 0
+              idx = 0
+            elsif idx >= length
+              idx = length - 1
+            end
+          else
+            idx = 0
+          end
+          delete(idx, op.text.bytesize)
+        when :add_marker
+          if op.meta.has_key?("adj")
+            idx = op.meta["adj"].to_i
+          else
+            idx = remap_index_in_list(op.index, done_ops)
+          end
+          if idx < 0
+            idx = 0
+          elsif idx > length
+            idx = length
+          end
+          if op.meta.has_key?("id")
+            id = op.meta["id"].to_i
+            aff = op.meta.has_key?("aff") && op.meta["aff"].to_i == 1 ? :before : :after
+            internal_add_marker_with_id(id, idx, aff)
+          end
+        when :remove_marker
+          if op.meta.has_key?("id")
+            id = op.meta["id"].to_i
+            remove_marker(id, false)
+          end
+        else
+          # ignore unknown op kinds
+        end
+        done_ops << op
       end
     end
 
@@ -1064,17 +1286,25 @@ module Vyx
       @transaction_stack ||= [] of Array(Operation)
     end
 
+    private def transaction_marker_stack : Array(Hash(Int32, Int32))
+      @transaction_marker_stack ||= [] of Hash(Int32, Int32)
+    end
+
     def begin_transaction
       transaction_stack << [] of Operation
+      transaction_marker_stack << marker_snapshot
       nil
     end
 
     def rollback_transaction
       ops = transaction_stack.pop
+      snapshot_before = transaction_marker_stack.pop
       return false unless ops
       @suppress_undo_record = true
-      ops.reverse_each do |op|
-        perform_inverse(op)
+      # undo ops in reverse using index remapping (ops store base indices)
+      unapply_ops_with_index_remap(ops)
+      if snapshot_before
+        restore_marker_offsets(snapshot_before)
       end
       @suppress_undo_record = false
       true
@@ -1082,11 +1312,15 @@ module Vyx
 
     def commit_transaction
       ops = transaction_stack.pop
+      snapshot_before = transaction_marker_stack.pop
       return false unless ops
-      trans = Operation.new(:transaction, 0, "", {} of String => String, ops)
+      snapshot_after = marker_snapshot
+      trans = Operation.new(:transaction, 0, "", {} of String => String, snapshot_before, snapshot_after, ops)
       if transaction_stack.size > 0
+        # nested transaction: append as a sub-op to parent and defer applying
         transaction_stack.last << trans
       else
+        # outermost commit: record the transaction as a single undo step
         @undo_stack << trans
         @redo_stack.clear
         emit_change(:transaction, {"count" => ops.size.to_s})
@@ -1098,9 +1332,9 @@ module Vyx
       begin_transaction
       begin
         yield
-      rescue
+      rescue e
         rollback_transaction
-        raise
+        raise e
       ensure
         if transaction_stack.size > 0
           commit_transaction
@@ -1221,6 +1455,16 @@ module Vyx
       return if bytes <= 0 || @add.bytesize == 0
       take = [bytes, @add.bytesize].min
 
+      # snapshot marker absolute offsets before rebuilding
+      marker_offsets = {} of Int32 => Int32
+      @markers.each do |id, m|
+        begin
+          marker_offsets[id] = marker_offset(id)
+        rescue
+          marker_offsets[id] = [[m.offset_in_piece, 0].max, length].min
+        end
+      end
+
       m = Benchmark.measure do
         orig_len = @original.bytesize
         moved = @add.byte_slice(0, take)
@@ -1282,6 +1526,10 @@ module Vyx
         @root = new_root
         @generation += 1
       end
+
+      # remap markers by absolute offsets
+      remap_all_markers(marker_offsets)
+      validate_marker_invariants
 
       dur_ms = m.real * 1000.0
       @compaction_count += 1
@@ -1393,6 +1641,10 @@ module Vyx
           r.not_nil!.parent = node
         end
         node.update!(@original, @add)
+        if l
+          l.not_nil!.parent = nil
+        end
+        node.parent = nil
         return {l, node}
       elsif bytes > left_bytes + node.piece.bytes_len
         l, r = split(node.right, bytes - left_bytes - node.piece.bytes_len)
@@ -1401,6 +1653,10 @@ module Vyx
           l.not_nil!.parent = node
         end
         node.update!(@original, @add)
+        if r
+          r.not_nil!.parent = nil
+        end
+        node.parent = nil
         return {node, r}
       else
         # split inside this node's piece
@@ -1409,10 +1665,13 @@ module Vyx
 
         left_node = nil
         right_node = nil
+        left_is_new = false
+        right_is_new = false
 
         if left_len > 0
           left_piece = Piece.new(node.piece.source, node.piece.start_bytes, left_len)
           left_node = Node.new(left_piece)
+          left_is_new = true
           left_node.left = node.left
           if left_node.left
             left_node.left.not_nil!.parent = left_node
@@ -1425,6 +1684,7 @@ module Vyx
         if right_len > 0
           right_piece = Piece.new(node.piece.source, node.piece.start_bytes + left_len, right_len)
           right_node = Node.new(right_piece)
+          right_is_new = true
           right_node.right = node.right
           if right_node.right
             right_node.right.not_nil!.parent = right_node
@@ -1465,7 +1725,7 @@ module Vyx
             else
               new_off = off - left_len
               right_list << {new_off, mid_id}
-              if right_node.is_a?(Node)
+              if right_node.is_a?(Node) && right_is_new
                 m.node = right_node
                 m.offset_in_piece = new_off
               else
@@ -1483,14 +1743,37 @@ module Vyx
               end
             end
           end
-          if left_node.is_a?(Node)
+          if left_node.is_a?(Node) && left_is_new
             left_node.markers = left_list
           end
-          if right_node.is_a?(Node)
+          if right_node.is_a?(Node) && right_is_new
             right_node.markers = right_list
+          elsif !right_list.empty?
+            # right side is existing subtree; attach any right_list markers to its leftmost node
+            succ = leftmost_node(right_node)
+            if succ
+              right_list.each do |off_id|
+                node_insert_marker(succ, off_id[1], 0)
+              end
+            else
+              right_list.each do |off_id|
+                mid_id = off_id[1]
+                abs = absolute_offset_by_node(node, left_len + off_id[0])
+                if @markers[mid_id]
+                  @markers[mid_id].node = nil
+                  @markers[mid_id].offset_in_piece = abs
+                end
+              end
+            end
           end
         end
 
+        if left_node
+          left_node.not_nil!.parent = nil
+        end
+        if right_node
+          right_node.not_nil!.parent = nil
+        end
         return {left_node, right_node}
       end
     end

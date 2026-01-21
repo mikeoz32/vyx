@@ -8,7 +8,7 @@ describe "Transactions (VYX-32.3)" do
       pt.insert(3, "YY")
     end
 
-    pt.to_s.should eq("aXXbYYcdef")
+    pt.to_s.should eq("aXXbcYYdef")
 
     # undo should undo both inserts in one step
     pt.undo.should eq(true)
